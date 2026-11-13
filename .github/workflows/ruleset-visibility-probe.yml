@@ -1,11 +1,22 @@
-# TEST ONLY - CreateScript S8.3 Phase 10B-2A, P-18 / P-21 probe for dog7dog/CreateScript-Registry-Test.
-# Reads the index-* tag rulesets A and B with the job's GITHUB_TOKEN (contents: read; metadata read is implicit)
-# and records only: HTTP status codes, which fields are present, the number of bypass actors if any are returned,
-# current_user_can_bypass, enforcement, created_at and updated_at. It writes nothing to the repository, uses no
-# third-party action, checks out nothing, and never prints the token or an Authorization header.
-# It fails (never reports success) when a request fails, a required field is missing, or the response differs
-# from the expectation (P-19: no bypass_actors for a read-only token; P-21: current_user_can_bypass "never" for A and B;
-# updated_at equal, as an instant, to the value the owner saw on 2026-11-13).
+# TEST ONLY - CreateScript S8.3 probe for dog7dog/CreateScript-Registry-Test (Phase 10B-2A P-18 / P-21; U-2 V1).
+# Reads, with the job's GITHUB_TOKEN (contents: read; metadata read is implicit), only with GET:
+#   - the repository (default_branch only),
+#   - the list of rulesets, the tag rulesets A and B, and every branch ruleset (U-2),
+#   - the rules that apply to the expected default branch (GET /rules/branches/main; observation only), requested
+#     only when the repository's default_branch is exactly that branch.
+# It records only: HTTP status codes, which fields are present, the number of bypass actors if any are returned,
+# current_user_can_bypass, enforcement, created_at, updated_at, the ref_name conditions and, for branch rulesets, the
+# rule types with their parameter names and the few parameter values that the registry relies on. It writes nothing
+# to the repository, uses no third-party action, checks out nothing, and never prints the token or an Authorization
+# header. Values that come from the API are escaped (control characters, workflow-command and Markdown characters)
+# before they reach the log or the job summary, and workflow commands are stopped while they are printed.
+# It fails (never reports success) when a request fails, a response cannot be read, the ruleset list may be
+# incomplete (more than one page), a required field is missing, or the response differs from what is expected:
+#   - P-19: a read-only token gets no bypass_actors (now also expected for branch rulesets; not verified for them yet),
+#   - P-21: current_user_can_bypass is "never" for this token (also expected for branch rulesets; not verified yet),
+#   - A and B keep the updated_at the owner saw on 2026-11-13 (compared as instants),
+#   - default_branch is "main".
+# Zero branch rulesets is a valid result.
 name: ruleset visibility probe (TEST ONLY)
 
 on:
@@ -27,7 +38,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Read the tag rulesets with GITHUB_TOKEN and record what is visible
+      - name: Read the repository and its rulesets with GITHUB_TOKEN and record what is visible
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -36,77 +47,204 @@ jobs:
           RULESET_B: "27176940"
           UPDATED_A: "2026-11-13T04:35:14.034Z"
           UPDATED_B: "2026-11-13T04:38:18.206Z"
+          EXPECTED_DEFAULT_BRANCH: "main"
+          # GitHub's largest page; a full page (or a "next" link) means the list may be incomplete, and the probe fails.
+          PAGE_SIZE: "100"
         run: |
           set -euo pipefail
           umask 077
           work="$(mktemp -d)"
           # GET with the token passed to curl on stdin (never in argv, never printed); prints the HTTP status only.
+          # $3, if given, receives the response headers (for the pagination check).
           get() {
             printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" |
-              curl -sS --max-time 30 -K - -o "$2" -w '%{http_code}' \
+              curl -sS --max-time 30 -K - -o "$2" ${3:+-D "$3"} -w '%{http_code}' \
                 -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
                 "https://api.github.com$1"
           }
-          list_status="$(get "/repos/$REPOSITORY/rulesets?per_page=100" "$work/list.json")" || list_status="curl-error"
+          repo_status="$(get "/repos/$REPOSITORY" "$work/repo.json")" || repo_status="curl-error"
+          list_status="$(get "/repos/$REPOSITORY/rulesets?per_page=$PAGE_SIZE" "$work/list.json" "$work/list.headers")" || list_status="curl-error"
           a_status="$(get "/repos/$REPOSITORY/rulesets/$RULESET_A" "$work/a.json")" || a_status="curl-error"
           b_status="$(get "/repos/$REPOSITORY/rulesets/$RULESET_B" "$work/b.json")" || b_status="curl-error"
-          export LIST_STATUS="$list_status" A_STATUS="$a_status" B_STATUS="$b_status" WORK="$work"
+          # every branch ruleset in the list; none is a valid result, but a list that cannot be read is not
+          : > "$work/branch-ids"
+          if [ "$list_status" = 200 ]; then
+            if ! jq -e 'type == "array"' "$work/list.json" > /dev/null 2>&1; then
+              echo "::error::the ruleset list (HTTP 200) is not a JSON array, so the branch rulesets cannot be listed"; exit 1
+            fi
+            if ! jq -r '.[] | select(type == "object" and .target == "branch") | .id | tostring' "$work/list.json" > "$work/branch-ids" 2> /dev/null; then
+              echo "::error::the branch ruleset IDs could not be extracted from the ruleset list"; exit 1
+            fi
+          fi
+          while read -r rid; do
+            case "$rid" in ''|*[!0-9]*) echo "::error::a branch ruleset in the list has an ID that is not a positive integer, so it cannot be requested"; exit 1 ;; esac
+            status="$(get "/repos/$REPOSITORY/rulesets/$rid" "$work/branch-$rid.json")" || status="curl-error"
+            printf '%s %s\n' "$rid" "$status" >> "$work/branch-status"
+          done < "$work/branch-ids"
+          # the rules of the default branch: requested only for the expected branch name (never for a value taken
+          # from the response), and only when the repository reports exactly that default branch
+          rules_status="not-requested"
+          branch="$(jq -r 'if type == "object" and (.default_branch | type) == "string" then .default_branch else "" end' "$work/repo.json" 2>/dev/null || true)"
+          if [ "$repo_status" = 200 ] && [ "$branch" = "$EXPECTED_DEFAULT_BRANCH" ]; then
+            rules_status="$(get "/repos/$REPOSITORY/rules/branches/$EXPECTED_DEFAULT_BRANCH" "$work/rules.json")" || rules_status="curl-error"
+          fi
+          export REPO_STATUS="$repo_status" LIST_STATUS="$list_status" A_STATUS="$a_status" B_STATUS="$b_status" RULES_STATUS="$rules_status" WORK="$work"
           python3 -I - <<'PY'
-          import json, os, re, sys
+          import json, os, re, secrets, sys
           from datetime import datetime
+          W = os.environ["WORK"]
           STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}(Z|[+-]\d{2}:\d{2})")
           def instant(text):
               if not isinstance(text, str) or not STAMP.fullmatch(text): return None
               return datetime.fromisoformat(text.replace("Z", "+00:00"))
           def load(name):
               try:
-                  return json.load(open(os.path.join(os.environ["WORK"], name)))
+                  return json.load(open(os.path.join(W, name)))
               except (OSError, ValueError):
                   return None
+          # Values from the API are shown through safe(): JSON-style escapes for every control character and line
+          # separator, and "::" broken up, so that one value can never start a new log line or a workflow command.
+          def safe(value):
+              text = value if isinstance(value, str) else json.dumps(value)
+              text = "".join(c if (c >= " " and c not in "\x7f\x85\u2028\u2029") else "\\u%04x" % ord(c) for c in text)
+              return text.replace("::", ":\u200b:")
+          def md(text):
+              return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("|", "&#124;").replace("`", "&#96;")
           problems, rows = [], []
-          # the list: only ids, names and targets of tag rulesets
-          lst = load("list.json")
-          rows.append(("GET /rulesets", os.environ["LIST_STATUS"], ""))
-          if os.environ["LIST_STATUS"] != "200" or not isinstance(lst, list):
-              problems.append("the ruleset list could not be read (HTTP %s)" % os.environ["LIST_STATUS"])
+          def ref_names(r):
+              rn = ((r.get("conditions") or {}).get("ref_name") or {}) if isinstance(r.get("conditions"), dict) else {}
+              return "include %s, exclude %s" % (safe(rn.get("include")), safe(rn.get("exclude")))
+          def common(label, r, status):
+              """Fields, bypass visibility (P-19) and current_user_can_bypass (P-21) for one ruleset."""
+              has_bypass = "bypass_actors" in r
+              count = len(r["bypass_actors"]) if has_bypass and isinstance(r["bypass_actors"], list) else None
+              fields = {k: (k in r) for k in ("id", "name", "target", "enforcement", "conditions", "rules", "created_at", "updated_at", "current_user_can_bypass", "bypass_actors")}
+              rows.append(("GET /rulesets/%s (%s)" % (safe(r.get("id")), label), status,
+                           "fields present: %s; missing: %s; bypass_actors returned: %s%s; current_user_can_bypass: %s; enforcement: %s; created_at: %s; updated_at: %s; %s" % (
+                               ", ".join(k for k, v in fields.items() if v), ", ".join(k for k, v in fields.items() if not v) or "none",
+                               "yes" if has_bypass else "no", "" if count is None else " (%d actor(s))" % count,
+                               safe(r.get("current_user_can_bypass")), safe(r.get("enforcement")), safe(r.get("created_at")), safe(r.get("updated_at")), ref_names(r))))
+              for k in ("enforcement", "created_at", "updated_at", "current_user_can_bypass", "conditions", "rules"):
+                  if k not in r: problems.append("%s: %s is missing" % (label, k))
+              if has_bypass: problems.append("%s: bypass_actors IS returned to GITHUB_TOKEN (P-19 expected it not to be)" % label)
+              if r.get("current_user_can_bypass") != "never": problems.append("%s: current_user_can_bypass is %s, expected never (P-21)" % (label, safe(r.get("current_user_can_bypass"))))
+              for k in ("created_at", "updated_at"):
+                  if k in r and instant(r.get(k)) is None: problems.append("%s: %s is not a GitHub timestamp (%s)" % (label, k, safe(r.get(k))))
+          # the repository: default_branch only
+          repo = load("repo.json")
+          expected_branch = os.environ["EXPECTED_DEFAULT_BRANCH"]
+          if os.environ["REPO_STATUS"] != "200" or not isinstance(repo, dict):
+              rows.append(("GET /repos/{repo}", safe(os.environ["REPO_STATUS"]), ""))
+              problems.append("the repository could not be read (HTTP %s)" % safe(os.environ["REPO_STATUS"]))
           else:
-              tags = sorted((r.get("id"), r.get("name")) for r in lst if isinstance(r, dict) and r.get("target") == "tag")
-              rows.append(("tag rulesets in the list", str(len(tags)), ", ".join("%s %s" % t for t in tags)))
+              rows.append(("GET /repos/{repo}", "200", "default_branch present: %s; default_branch: %s" % ("default_branch" in repo, safe(repo.get("default_branch")))))
+              if repo.get("default_branch") != expected_branch:
+                  problems.append("default_branch is %s, expected %s" % (safe(repo.get("default_branch")), expected_branch))
+          # the list: ids, names, targets and enforcement only; it must be complete (one page that is not full)
+          lst = load("list.json")
+          rows.append(("GET /rulesets", safe(os.environ["LIST_STATUS"]), ""))
+          branch_ids = []
+          if os.environ["LIST_STATUS"] != "200" or not isinstance(lst, list):
+              problems.append("the ruleset list could not be read (HTTP %s)" % safe(os.environ["LIST_STATUS"]))
+          else:
+              try:
+                  headers = open(os.path.join(W, "list.headers"), encoding="latin-1").read()
+              except OSError:
+                  headers = None
+              page = int(os.environ["PAGE_SIZE"])
+              if headers is None:
+                  problems.append("the ruleset list's response headers are missing, so it cannot be shown that the list is complete")
+              elif re.search(r'(?im)^link:.*rel="next"', headers):
+                  problems.append("the ruleset list has another page (Link rel=next); this probe reads one page only and does not report an incomplete list")
+              if len(lst) >= page:
+                  problems.append("the ruleset list has %d items, a full page of %d: it may be incomplete" % (len(lst), page))
+              items = [r for r in lst if isinstance(r, dict)]
+              if len(items) != len(lst): problems.append("the ruleset list has %d item(s) that are not objects" % (len(lst) - len(items)))
+              for r in items:
+                  if not (isinstance(r.get("id"), int) and not isinstance(r.get("id"), bool) and r["id"] > 0):
+                      problems.append("a ruleset in the list (target %s) has a non-numeric or missing id %s, so it cannot be matched" % (safe(r.get("target")), safe(r.get("id"))))
+              def ok_id(r): return isinstance(r.get("id"), int) and not isinstance(r.get("id"), bool) and r["id"] > 0
+              tags = sorted((r["id"], safe(r.get("name")), safe(r.get("enforcement"))) for r in items if ok_id(r) and r.get("target") == "tag")
+              branches = sorted((r["id"], safe(r.get("name")), safe(r.get("enforcement"))) for r in items if ok_id(r) and r.get("target") == "branch")
+              others = sorted((r["id"], safe(r.get("target"))) for r in items if ok_id(r) and r.get("target") not in ("tag", "branch"))
+              branch_ids = [b[0] for b in branches]
+              rows.append(("tag rulesets in the list", str(len(tags)), ", ".join("%s %s (%s)" % t for t in tags)))
+              rows.append(("branch rulesets in the list", str(len(branches)), ", ".join("%s %s (%s)" % b for b in branches) or "none"))
+              if others: rows.append(("other rulesets in the list", str(len(others)), ", ".join("%s %s" % o for o in others)))
               for rid in (os.environ["RULESET_A"], os.environ["RULESET_B"]):
                   if int(rid) not in [t[0] for t in tags]: problems.append("ruleset %s is not in the list" % rid)
+          # A and B (unchanged from the P-18 / P-21 probe)
           for label, rid, status_key, file, want_updated in (
                   ("A", os.environ["RULESET_A"], "A_STATUS", "a.json", os.environ["UPDATED_A"]),
                   ("B", os.environ["RULESET_B"], "B_STATUS", "b.json", os.environ["UPDATED_B"])):
-              status = os.environ[status_key]
+              status = safe(os.environ[status_key])
               r = load(file)
               if status != "200" or not isinstance(r, dict):
                   rows.append(("GET /rulesets/%s (%s)" % (rid, label), status, ""))
                   problems.append("ruleset %s (%s) could not be read (HTTP %s)" % (rid, label, status))
                   continue
-              has_bypass = "bypass_actors" in r
-              bypass_count = len(r["bypass_actors"]) if has_bypass and isinstance(r["bypass_actors"], list) else None
-              fields = {k: (k in r) for k in ("id", "name", "target", "enforcement", "conditions", "rules", "created_at", "updated_at", "current_user_can_bypass", "bypass_actors")}
-              rows.append(("GET /rulesets/%s (%s)" % (rid, label), status,
-                           "fields present: %s; missing: %s; bypass_actors returned: %s%s; current_user_can_bypass: %s; enforcement: %s; created_at: %s; updated_at: %s" % (
-                               ", ".join(k for k, v in fields.items() if v), ", ".join(k for k, v in fields.items() if not v) or "none",
-                               "yes" if has_bypass else "no", "" if bypass_count is None else " (%d actor(s))" % bypass_count,
-                               r.get("current_user_can_bypass"), r.get("enforcement"), r.get("created_at"), r.get("updated_at"))))
-              if str(r.get("id")) != rid: problems.append("ruleset %s (%s): unexpected id" % (rid, label))
-              for k in ("enforcement", "created_at", "updated_at", "current_user_can_bypass"):
-                  if k not in r: problems.append("ruleset %s (%s): %s is missing" % (rid, label, k))
-              if has_bypass: problems.append("ruleset %s (%s): bypass_actors IS returned to GITHUB_TOKEN (P-19 expected it not to be)" % (rid, label))
-              if r.get("current_user_can_bypass") != "never": problems.append("ruleset %s (%s): current_user_can_bypass is %r, expected 'never' (P-21)" % (rid, label, r.get("current_user_can_bypass")))
-              if r.get("enforcement") != "active": problems.append("ruleset %s (%s): enforcement is %r" % (rid, label, r.get("enforcement")))
+              common("tag ruleset %s" % label, r, status)
+              if str(r.get("id")) != rid: problems.append("ruleset %s (%s): the response has the id %s" % (rid, label, safe(r.get("id"))))
+              if r.get("enforcement") != "active": problems.append("ruleset %s (%s): enforcement is %s" % (rid, label, safe(r.get("enforcement"))))
               got = instant(r.get("updated_at"))
-              if got is None: problems.append("ruleset %s (%s): updated_at is not a GitHub timestamp" % (rid, label))
-              elif got != instant(want_updated): problems.append("ruleset %s (%s): updated_at differs from the owner's baseline (the ruleset changed?)" % (rid, label))
+              if got is not None and got != instant(want_updated): problems.append("ruleset %s (%s): updated_at differs from the owner's baseline (the ruleset changed?)" % (rid, label))
+          # every branch ruleset (U-2): observation of the response shape; any enforcement is accepted here
+          statuses = {}
+          try:
+              for line in open(os.path.join(W, "branch-status")):
+                  rid, status = line.split()
+                  statuses[int(rid)] = status
+          except OSError:
+              pass
+          for rid in branch_ids:
+              status = safe(statuses.get(rid, "not-requested"))
+              r = load("branch-%s.json" % rid)
+              if status != "200" or not isinstance(r, dict):
+                  rows.append(("GET /rulesets/%s (branch)" % rid, status, ""))
+                  problems.append("branch ruleset %s could not be read (HTTP %s)" % (rid, status))
+                  continue
+              common("branch ruleset %s" % rid, r, status)
+              if r.get("id") != rid: problems.append("branch ruleset %s: the response has the id %s" % (rid, safe(r.get("id"))))
+              if r.get("target") != "branch": problems.append("branch ruleset %s: target is %s" % (rid, safe(r.get("target"))))
+              shapes = []
+              for rule in (r.get("rules") or []):
+                  if not isinstance(rule, dict): continue
+                  params = rule.get("parameters") if isinstance(rule.get("parameters"), dict) else {}
+                  shape = "%s(%s)" % (safe(rule.get("type")), ",".join(safe(k) for k in sorted(params)))
+                  if rule.get("type") == "pull_request":
+                      shape += " approvals=%s code_owner=%s last_push=%s dismiss_stale=%s threads=%s" % tuple(safe(params.get(k)) for k in (
+                          "required_approving_review_count", "require_code_owner_review", "require_last_push_approval",
+                          "dismiss_stale_reviews_on_push", "required_review_thread_resolution"))
+                  if rule.get("type") == "required_status_checks":
+                      checks = [[c.get("context"), c.get("integration_id")] for c in (params.get("required_status_checks") or []) if isinstance(c, dict)]
+                      shape += " checks=%s strict=%s" % (safe(checks), safe(params.get("strict_required_status_checks_policy")))
+                  shapes.append(shape)
+              rows.append(("  rules of branch ruleset %s" % rid, "", "; ".join(shapes) or "none"))
+          # the rules of the expected default branch: observation only (response fields are not documented)
+          rules_status = safe(os.environ["RULES_STATUS"])
+          rules = load("rules.json")
+          if rules_status == "not-requested":
+              rows.append(("GET /rules/branches/%s" % expected_branch, "not requested", "the repository's default_branch is not %s (or unreadable)" % expected_branch))
+              problems.append("the rules of %s were not requested because the repository's default_branch is not exactly %s" % (expected_branch, expected_branch))
+          elif rules_status != "200" or not isinstance(rules, list):
+              rows.append(("GET /rules/branches/%s" % expected_branch, rules_status, ""))
+              problems.append("the rules of the default branch could not be read (HTTP %s)" % rules_status)
+          else:
+              keys = sorted({k for item in rules if isinstance(item, dict) for k in item})
+              types = [item.get("type") for item in rules if isinstance(item, dict)]
+              rows.append(("GET /rules/branches/%s" % expected_branch, "200", "%d rule(s); types %s; item fields %s" % (len(rules), safe(types), safe(keys))))
+          # the log: workflow commands are stopped while the rows (which contain API values) are printed
+          resume = secrets.token_hex(16)
+          print("::stop-commands::" + resume)
           for name, status, detail in rows: print("%s -> %s %s" % (name, status, detail))
+          print("::" + resume + "::")
           summary = os.environ.get("GITHUB_STEP_SUMMARY")
           if summary:
               with open(summary, "a") as f:
-                  f.write("### Ruleset visibility with GITHUB_TOKEN (TEST ONLY)\n\n| request | HTTP | observation |\n|---|---|---|\n")
-                  for name, status, detail in rows: f.write("| %s | %s | %s |\n" % (name, status, detail.replace("|", "/")))
-                  f.write("\n**Result:** %s\n" % ("as expected" if not problems else "UNEXPECTED - " + "; ".join(problems)))
-          for p in problems: print("::error::" + p)
+                  f.write("### Repository and ruleset visibility with GITHUB_TOKEN (TEST ONLY)\n\n| request | HTTP | observation |\n|---|---|---|\n")
+                  for name, status, detail in rows: f.write("| %s | %s | %s |\n" % (md(name), md(status), md(detail)))
+                  f.write("\n**Result:** %s\n" % ("as expected" if not problems else "UNEXPECTED - " + md("; ".join(problems))))
+          # ::error:: data is escaped as GitHub documents for workflow commands (%, CR, LF)
+          for p in problems: print("::error::" + p.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
           sys.exit(1 if problems else 0)
           PY
