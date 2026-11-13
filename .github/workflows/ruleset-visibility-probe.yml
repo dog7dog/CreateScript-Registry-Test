@@ -1,0 +1,112 @@
+# TEST ONLY - CreateScript S8.3 Phase 10B-2A, P-18 / P-21 probe for dog7dog/CreateScript-Registry-Test.
+# Reads the index-* tag rulesets A and B with the job's GITHUB_TOKEN (contents: read; metadata read is implicit)
+# and records only: HTTP status codes, which fields are present, the number of bypass actors if any are returned,
+# current_user_can_bypass, enforcement, created_at and updated_at. It writes nothing to the repository, uses no
+# third-party action, checks out nothing, and never prints the token or an Authorization header.
+# It fails (never reports success) when a request fails, a required field is missing, or the response differs
+# from the expectation (P-19: no bypass_actors for a read-only token; P-21: current_user_can_bypass "never" for A and B;
+# updated_at equal, as an instant, to the value the owner saw on 2026-11-13).
+name: ruleset visibility probe (TEST ONLY)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ruleset-visibility-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    # Runs only in the test repository, even if this file is copied elsewhere.
+    if: github.repository == 'dog7dog/CreateScript-Registry-Test'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Read the tag rulesets with GITHUB_TOKEN and record what is visible
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          # Ruleset IDs and the updated_at values the owner's token saw (G0 baseline, 2026-11-13).
+          RULESET_A: "27176846"
+          RULESET_B: "27176940"
+          UPDATED_A: "2026-11-13T04:35:14.034Z"
+          UPDATED_B: "2026-11-13T04:38:18.206Z"
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$(mktemp -d)"
+          # GET with the token passed to curl on stdin (never in argv, never printed); prints the HTTP status only.
+          get() {
+            printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" |
+              curl -sS --max-time 30 -K - -o "$2" -w '%{http_code}' \
+                -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "https://api.github.com$1"
+          }
+          list_status="$(get "/repos/$REPOSITORY/rulesets?per_page=100" "$work/list.json")" || list_status="curl-error"
+          a_status="$(get "/repos/$REPOSITORY/rulesets/$RULESET_A" "$work/a.json")" || a_status="curl-error"
+          b_status="$(get "/repos/$REPOSITORY/rulesets/$RULESET_B" "$work/b.json")" || b_status="curl-error"
+          export LIST_STATUS="$list_status" A_STATUS="$a_status" B_STATUS="$b_status" WORK="$work"
+          python3 -I - <<'PY'
+          import json, os, re, sys
+          from datetime import datetime
+          STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}(Z|[+-]\d{2}:\d{2})")
+          def instant(text):
+              if not isinstance(text, str) or not STAMP.fullmatch(text): return None
+              return datetime.fromisoformat(text.replace("Z", "+00:00"))
+          def load(name):
+              try:
+                  return json.load(open(os.path.join(os.environ["WORK"], name)))
+              except (OSError, ValueError):
+                  return None
+          problems, rows = [], []
+          # the list: only ids, names and targets of tag rulesets
+          lst = load("list.json")
+          rows.append(("GET /rulesets", os.environ["LIST_STATUS"], ""))
+          if os.environ["LIST_STATUS"] != "200" or not isinstance(lst, list):
+              problems.append("the ruleset list could not be read (HTTP %s)" % os.environ["LIST_STATUS"])
+          else:
+              tags = sorted((r.get("id"), r.get("name")) for r in lst if isinstance(r, dict) and r.get("target") == "tag")
+              rows.append(("tag rulesets in the list", str(len(tags)), ", ".join("%s %s" % t for t in tags)))
+              for rid in (os.environ["RULESET_A"], os.environ["RULESET_B"]):
+                  if int(rid) not in [t[0] for t in tags]: problems.append("ruleset %s is not in the list" % rid)
+          for label, rid, status_key, file, want_updated in (
+                  ("A", os.environ["RULESET_A"], "A_STATUS", "a.json", os.environ["UPDATED_A"]),
+                  ("B", os.environ["RULESET_B"], "B_STATUS", "b.json", os.environ["UPDATED_B"])):
+              status = os.environ[status_key]
+              r = load(file)
+              if status != "200" or not isinstance(r, dict):
+                  rows.append(("GET /rulesets/%s (%s)" % (rid, label), status, ""))
+                  problems.append("ruleset %s (%s) could not be read (HTTP %s)" % (rid, label, status))
+                  continue
+              has_bypass = "bypass_actors" in r
+              bypass_count = len(r["bypass_actors"]) if has_bypass and isinstance(r["bypass_actors"], list) else None
+              fields = {k: (k in r) for k in ("id", "name", "target", "enforcement", "conditions", "rules", "created_at", "updated_at", "current_user_can_bypass", "bypass_actors")}
+              rows.append(("GET /rulesets/%s (%s)" % (rid, label), status,
+                           "fields present: %s; missing: %s; bypass_actors returned: %s%s; current_user_can_bypass: %s; enforcement: %s; created_at: %s; updated_at: %s" % (
+                               ", ".join(k for k, v in fields.items() if v), ", ".join(k for k, v in fields.items() if not v) or "none",
+                               "yes" if has_bypass else "no", "" if bypass_count is None else " (%d actor(s))" % bypass_count,
+                               r.get("current_user_can_bypass"), r.get("enforcement"), r.get("created_at"), r.get("updated_at"))))
+              if str(r.get("id")) != rid: problems.append("ruleset %s (%s): unexpected id" % (rid, label))
+              for k in ("enforcement", "created_at", "updated_at", "current_user_can_bypass"):
+                  if k not in r: problems.append("ruleset %s (%s): %s is missing" % (rid, label, k))
+              if has_bypass: problems.append("ruleset %s (%s): bypass_actors IS returned to GITHUB_TOKEN (P-19 expected it not to be)" % (rid, label))
+              if r.get("current_user_can_bypass") != "never": problems.append("ruleset %s (%s): current_user_can_bypass is %r, expected 'never' (P-21)" % (rid, label, r.get("current_user_can_bypass")))
+              if r.get("enforcement") != "active": problems.append("ruleset %s (%s): enforcement is %r" % (rid, label, r.get("enforcement")))
+              got = instant(r.get("updated_at"))
+              if got is None: problems.append("ruleset %s (%s): updated_at is not a GitHub timestamp" % (rid, label))
+              elif got != instant(want_updated): problems.append("ruleset %s (%s): updated_at differs from the owner's baseline (the ruleset changed?)" % (rid, label))
+          for name, status, detail in rows: print("%s -> %s %s" % (name, status, detail))
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a") as f:
+                  f.write("### Ruleset visibility with GITHUB_TOKEN (TEST ONLY)\n\n| request | HTTP | observation |\n|---|---|---|\n")
+                  for name, status, detail in rows: f.write("| %s | %s | %s |\n" % (name, status, detail.replace("|", "/")))
+                  f.write("\n**Result:** %s\n" % ("as expected" if not problems else "UNEXPECTED - " + "; ".join(problems)))
+          for p in problems: print("::error::" + p)
+          sys.exit(1 if problems else 0)
+          PY
